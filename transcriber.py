@@ -56,7 +56,8 @@ class Transcriber:
         for s in segs:
             text = s.text.strip()
             # Descartar segmentos sin habla (alucinaciones de Whisper)
-            if text and s.no_speech_prob < 0.6:
+            # Umbral alto: solo filtrar silencio claro, no voz con ruido de fondo
+            if text and s.no_speech_prob < 0.85:
                 result.segments.append(Segment(
                     text  = text,
                     start = offset + s.start,

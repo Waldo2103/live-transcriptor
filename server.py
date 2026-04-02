@@ -856,7 +856,7 @@ async function startMic() {
         micWs.send(e.data);
       }
     };
-    mediaRec.start(3000);  // chunk cada 3 segundos
+    mediaRec.start(6000);  // chunk cada 6 segundos — más contexto para Whisper
     setStatus('running', 'Escuchando micrófono...');
   };
 
