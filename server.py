@@ -290,13 +290,19 @@ async def ws_mic_endpoint(ws: WebSocket):
     offset   = 0.0
 
     broadcast({"type": "status", "status": "running", "msg": "Micrófono conectado. Escuchando..."})
+    await ws.send_json({"type": "debug", "msg": f"Formato de audio: {audio_ext}"})
 
+    chunk_n = 0
     try:
         while True:
             try:
                 data = await asyncio.wait_for(ws.receive_bytes(), timeout=30)
             except asyncio.TimeoutError:
+                await ws.send_json({"type": "debug", "msg": "Timeout: no llegaron chunks en 30s"})
                 break
+
+            chunk_n += 1
+            await ws.send_json({"type": "debug", "msg": f"Chunk #{chunk_n}: {len(data)} bytes ({audio_ext})"})
 
             # Convertir audio del browser → PCM 16kHz mono con ffmpeg
             with tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False) as f:
@@ -310,17 +316,24 @@ async def ws_mic_endpoint(ws: WebSocket):
                     "-i", tmp_in,
                     "-ar", "16000", "-ac", "1", "-f", "s16le", tmp_out,
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                await proc.wait()
+                _, ffmpeg_err = await proc.communicate()
 
-                if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 512:
+                pcm_size = os.path.getsize(tmp_out) if os.path.exists(tmp_out) else 0
+                await ws.send_json({"type": "debug",
+                    "msg": f"ffmpeg rc={proc.returncode} pcm={pcm_size}b" +
+                           (f" err={ffmpeg_err.decode()[:120]}" if ffmpeg_err else "")})
+
+                if pcm_size < 512:
+                    await ws.send_json({"type": "debug", "msg": "PCM muy pequeño, saltando"})
                     continue
 
                 audio = (
                     np.frombuffer(open(tmp_out, "rb").read(), dtype=np.int16)
                     .astype(np.float32) / 32_768.0
                 )
+                await ws.send_json({"type": "debug", "msg": f"Audio: {len(audio)/16000:.1f}s → Whisper..."})
             finally:
                 os.unlink(tmp_in)
                 if os.path.exists(tmp_out):
@@ -347,6 +360,9 @@ async def ws_mic_endpoint(ws: WebSocket):
                 session["segments"].append(seg_data)
                 await ws.send_json(seg_data)
                 broadcast(seg_data)
+
+            await ws.send_json({"type": "debug",
+                "msg": f"Whisper: {len(result.segments)} segmentos (idioma={result.language})"})
 
             if result.segments:
                 offset = result.segments[-1].end
@@ -676,6 +692,18 @@ function handleMessage(msg) {
     document.getElementById('btn-start').disabled = false;
     document.getElementById('btn-stop').disabled  = true;
   }
+  if (msg.type === 'debug') {
+    addDebug(msg.msg);
+  }
+}
+
+function addDebug(msg) {
+  const area = document.getElementById('transcript-area');
+  const div  = document.createElement('div');
+  div.style.cssText = 'font-size:.7rem;color:#4a5568;font-family:monospace;padding:.1rem .6rem';
+  div.textContent = '› ' + msg;
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
 }
 
 // ── Segmentos ────────────────────────────────────────────────────────────────
@@ -849,7 +877,8 @@ async function startMic() {
   micWs.binaryType = 'arraybuffer';
 
   micWs.onopen = () => {
-    // MediaRecorder manda chunks de ~3s al WebSocket
+    addDebug(`mimeType elegido: "${mimeType || '(default)'}" → ext=${audioExt}`);
+    // MediaRecorder manda chunks de ~6s al WebSocket
     mediaRec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
     mediaRec.ondataavailable = (e) => {
       if (e.data.size > 0 && micWs.readyState === WebSocket.OPEN) {
