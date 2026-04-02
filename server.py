@@ -878,16 +878,35 @@ async function startMic() {
 
   micWs.onopen = () => {
     addDebug(`mimeType elegido: "${mimeType || '(default)'}" → ext=${audioExt}`);
-    // MediaRecorder manda chunks de ~6s al WebSocket
-    mediaRec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
-    mediaRec.ondataavailable = (e) => {
-      if (e.data.size > 0 && micWs.readyState === WebSocket.OPEN) {
+    setStatus('running', 'Escuchando micrófono...');
+    startChunk();
+  };
+
+  function startChunk() {
+    if (!micStream || !micWs || micWs.readyState !== WebSocket.OPEN) return;
+
+    // Crear un MediaRecorder nuevo por chunk: cada stop() produce un WebM
+    // completo con header propio, que ffmpeg puede parsear correctamente.
+    const rec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
+    mediaRec = rec;
+
+    rec.ondataavailable = (e) => {
+      if (e.data.size > 0 && micWs && micWs.readyState === WebSocket.OPEN) {
         micWs.send(e.data);
       }
     };
-    mediaRec.start(6000);  // chunk cada 6 segundos — más contexto para Whisper
-    setStatus('running', 'Escuchando micrófono...');
-  };
+
+    rec.onstop = () => {
+      // Arrancar el próximo chunk inmediatamente
+      startChunk();
+    };
+
+    rec.start();
+    // Detener después de 6s → ondataavailable → onstop → startChunk
+    setTimeout(() => {
+      if (rec.state === 'recording') rec.stop();
+    }, 6000);
+  }
 
   micWs.onmessage = (e) => {
     const msg = JSON.parse(e.data);
@@ -897,11 +916,13 @@ async function startMic() {
   micWs.onclose = () => stopMic(false);
 }
 
-function stopMic(sendStop = true) {
-  if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+function stopMic() {
+  // Cerrar el WS primero para que startChunk() no lance otro ciclo
   if (micWs && micWs.readyState === WebSocket.OPEN) micWs.close();
-  micWs = null; mediaRec = null;
+  micWs = null;
+  if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
+  mediaRec = null;
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
