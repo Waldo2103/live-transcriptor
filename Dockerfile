@@ -4,8 +4,6 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
-    libasound2-dev \
-    portaudio19-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp

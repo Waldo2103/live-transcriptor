@@ -17,8 +17,11 @@ import os
 import threading
 import queue
 import time
+import tempfile
 from datetime import datetime
 from typing import Optional
+
+import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -249,9 +252,9 @@ def get_transcript(timestamps: str = "si"):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    """WebSocket de control: recibe JSON de control, envía segmentos transcritos."""
     await ws.accept()
     _ws_clients.add(ws)
-    # Enviar estado actual al conectar (para re-conexiones)
     await ws.send_json({
         "type":    "init",
         "session": {
@@ -263,9 +266,99 @@ async def ws_endpoint(ws: WebSocket):
     })
     try:
         while True:
-            await ws.receive_text()   # keep-alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         _ws_clients.discard(ws)
+
+
+@app.websocket("/ws-mic")
+async def ws_mic_endpoint(ws: WebSocket):
+    """
+    WebSocket de audio: el browser manda chunks de audio WebM/Opus,
+    el server los convierte a PCM con ffmpeg y transcribe con Whisper.
+    """
+    await ws.accept()
+
+    language       = ws.query_params.get("language", "") or None
+    initial_prompt = ws.query_params.get("prompt", "")   or None
+    fact_check_on  = ws.query_params.get("fc", "no") == "si"
+
+    whisper  = tr.get_transcriber(WHISPER_MODEL, WHISPER_DEVICE)
+    provider = get_provider(LLM_PROVIDER, host=OLLAMA_HOST, model=OLLAMA_MODELO)
+    fc       = FactChecker(provider, enabled=fact_check_on)
+    offset   = 0.0
+
+    broadcast({"type": "status", "status": "running", "msg": "Micrófono conectado. Escuchando..."})
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_bytes(), timeout=30)
+            except asyncio.TimeoutError:
+                break
+
+            # Convertir WebM/Opus → PCM 16kHz mono con ffmpeg
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+                f.write(data)
+                tmp_in = f.name
+            tmp_out = tmp_in + ".pcm"
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", tmp_in,
+                    "-ar", "16000", "-ac", "1", "-f", "s16le", tmp_out,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+
+                if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 512:
+                    continue
+
+                audio = (
+                    np.frombuffer(open(tmp_out, "rb").read(), dtype=np.int16)
+                    .astype(np.float32) / 32_768.0
+                )
+            finally:
+                os.unlink(tmp_in)
+                if os.path.exists(tmp_out):
+                    os.unlink(tmp_out)
+
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda a=audio, o=offset: whisper.transcribe(
+                    a, offset=o, language=language, initial_prompt=initial_prompt
+                )
+            )
+
+            for seg in result.segments:
+                fc_result = fc.check(seg.text)
+                seg_data  = {
+                    "type":       "segment",
+                    "text":       seg.text,
+                    "ts":         secs_to_ts(seg.start),
+                    "start":      seg.start,
+                    "end":        seg.end,
+                    "language":   result.language,
+                    "fact_check": fc_result,
+                }
+                session["segments"].append(seg_data)
+                await ws.send_json(seg_data)
+                broadcast(seg_data)
+
+            if result.segments:
+                offset = result.segments[-1].end
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "msg": str(e)})
+        except Exception:
+            pass
+    finally:
+        broadcast({"type": "status", "status": "stopped", "msg": "Micrófono desconectado."})
 
 
 @app.on_event("startup")
@@ -646,17 +739,24 @@ async function startSession() {
   const fc     = document.getElementById('tog-fc').checked;
   const ts     = document.getElementById('tog-timestamps').checked;
 
-  if (activeSource === 'youtube' && !url) {
-    alert('Ingresá la URL del video o stream.');
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('btn-stop').disabled  = false;
+  document.getElementById('empty-state')?.remove();
+  setStatus('starting', 'Conectando...');
+
+  if (activeSource === 'microphone') {
+    await startMic();
     return;
   }
 
-  document.getElementById('btn-start').disabled = true;
-  document.getElementById('btn-stop').disabled  = false;
-  setStatus('starting', 'Conectando...');
+  // YouTube
+  if (!url) {
+    alert('Ingresá la URL del video o stream.');
+    resetUI(); return;
+  }
 
   const fd = new FormData();
-  fd.append('source',          activeSource);
+  fd.append('source',          'youtube');
   fd.append('url',             url);
   fd.append('fact_check',      fc ? 'si' : 'no');
   fd.append('show_timestamps', ts ? 'si' : 'no');
@@ -668,22 +768,27 @@ async function startSession() {
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       alert(d.detail || 'Error al iniciar la sesión.');
-      document.getElementById('btn-start').disabled = false;
-      document.getElementById('btn-stop').disabled  = true;
-      setStatus('idle', 'Sin sesión');
+      resetUI();
     }
   } catch(e) {
     alert('Error de red.');
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-stop').disabled  = true;
+    resetUI();
   }
 }
 
 async function stopSession() {
-  await fetch('/api/stop', {method: 'POST'});
+  if (activeSource === 'microphone') {
+    stopMic();
+  } else {
+    await fetch('/api/stop', {method: 'POST'});
+  }
+  resetUI();
+  setStatus('idle', 'Sesión detenida');
+}
+
+function resetUI() {
   document.getElementById('btn-start').disabled = false;
   document.getElementById('btn-stop').disabled  = true;
-  setStatus('idle', 'Sesión detenida');
 }
 
 function clearTranscript() {
@@ -707,6 +812,59 @@ function setStatus(status, msg) {
 
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Micrófono (Web Audio API → WebSocket) ────────────────────────────────────
+let micWs        = null;
+let mediaRec     = null;
+let micStream    = null;
+
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch(e) {
+    alert('No se pudo acceder al micrófono: ' + e.message);
+    resetUI();
+    return;
+  }
+
+  const lang   = document.getElementById('sel-lang').value;
+  const prompt = encodeURIComponent(document.getElementById('input-prompt').value.trim());
+  const fc     = document.getElementById('tog-fc').checked ? 'si' : 'no';
+  const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url    = `${proto}://${location.host}/ws-mic?language=${lang}&prompt=${prompt}&fc=${fc}`;
+
+  micWs = new WebSocket(url);
+  micWs.binaryType = 'arraybuffer';
+
+  micWs.onopen = () => {
+    // MediaRecorder manda chunks de ~3s al WebSocket
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
+
+    mediaRec = new MediaRecorder(micStream, { mimeType });
+    mediaRec.ondataavailable = (e) => {
+      if (e.data.size > 0 && micWs.readyState === WebSocket.OPEN) {
+        micWs.send(e.data);
+      }
+    };
+    mediaRec.start(3000);  // chunk cada 3 segundos
+    setStatus('running', 'Escuchando micrófono...');
+  };
+
+  micWs.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleMessage(msg);
+  };
+
+  micWs.onclose = () => stopMic(false);
+}
+
+function stopMic(sendStop = true) {
+  if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (micWs && micWs.readyState === WebSocket.OPEN) micWs.close();
+  micWs = null; mediaRec = null;
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
