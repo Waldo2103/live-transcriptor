@@ -10,7 +10,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"      # acceso a Ollama en el host
     environment:
-      - WHISPER_MODEL=medium
+      - WHISPER_MODEL=small   # medium es demasiado lento para CPU en tiempo real
       - WHISPER_DEVICE=cpu
       - OLLAMA_HOST=http://host.docker.internal:11434
       - OLLAMA_MODELO=llama3
