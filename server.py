@@ -100,6 +100,10 @@ def _transcription_worker(source, fact_checker: FactChecker,
                 continue
 
             if chunk is None:
+                if source.error:
+                    session["error"] = source.error
+                    broadcast({"type": "error",
+                               "msg": f"Error en la fuente de audio: {source.error}"})
                 break
 
             result = whisper.transcribe(
@@ -458,6 +462,9 @@ input:checked + .slider:before { transform: translateX(16px); }
         <button class="source-tab active" id="tab-mic"     onclick="setSource('microphone')">🎙 Micrófono</button>
         <button class="source-tab"        id="tab-youtube" onclick="setSource('youtube')">▶ YouTube</button>
       </div>
+      <div id="panel-mic-note" style="font-size:.72rem;color:#d97706;background:#78350f22;border-radius:5px;padding:.4rem .6rem;margin-bottom:.5rem">
+        ⚠️ Micrófono requiere correr fuera de Docker. En el server usá YouTube.
+      </div>
       <div id="panel-youtube" style="display:none" class="input-group">
         <label>URL del video o stream</label>
         <input type="url" id="input-url" placeholder="https://youtube.com/watch?v=...">
@@ -618,6 +625,7 @@ function setSource(s) {
   document.getElementById('tab-mic').classList.toggle('active', s === 'microphone');
   document.getElementById('tab-youtube').classList.toggle('active', s === 'youtube');
   document.getElementById('panel-youtube').style.display = s === 'youtube' ? 'block' : 'none';
+  document.getElementById('panel-mic-note').style.display = s === 'microphone' ? 'block' : 'none';
 }
 
 function toggleTimestamps() {
