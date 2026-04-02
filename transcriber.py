@@ -55,7 +55,8 @@ class Transcriber:
         result = TranscriptChunk(language=info.language)
         for s in segs:
             text = s.text.strip()
-            if text:
+            # Descartar segmentos sin habla (alucinaciones de Whisper)
+            if text and s.no_speech_prob < 0.6:
                 result.segments.append(Segment(
                     text  = text,
                     start = offset + s.start,

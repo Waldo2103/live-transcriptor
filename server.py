@@ -282,6 +282,7 @@ async def ws_mic_endpoint(ws: WebSocket):
     language       = ws.query_params.get("language", "") or None
     initial_prompt = ws.query_params.get("prompt", "")   or None
     fact_check_on  = ws.query_params.get("fc", "no") == "si"
+    audio_ext      = ws.query_params.get("ext", ".webm")  # Safari manda .mp4
 
     whisper  = tr.get_transcriber(WHISPER_MODEL, WHISPER_DEVICE)
     provider = get_provider(LLM_PROVIDER, host=OLLAMA_HOST, model=OLLAMA_MODELO)
@@ -297,8 +298,8 @@ async def ws_mic_endpoint(ws: WebSocket):
             except asyncio.TimeoutError:
                 break
 
-            # Convertir WebM/Opus → PCM 16kHz mono con ffmpeg
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+            # Convertir audio del browser → PCM 16kHz mono con ffmpeg
+            with tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False) as f:
                 f.write(data)
                 tmp_in = f.name
             tmp_out = tmp_in + ".pcm"
@@ -832,17 +833,24 @@ async function startMic() {
   const prompt = encodeURIComponent(document.getElementById('input-prompt').value.trim());
   const fc     = document.getElementById('tog-fc').checked ? 'si' : 'no';
   const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url    = `${proto}://${location.host}/ws-mic?language=${lang}&prompt=${prompt}&fc=${fc}`;
+
+  // Safari usa mp4; Chrome/Firefox usan webm — detectar antes de abrir el WS
+  const MIME_CANDIDATES = [
+    'audio/webm;codecs=opus', 'audio/webm',
+    'audio/mp4', 'audio/ogg;codecs=opus',
+  ];
+  const mimeType = MIME_CANDIDATES.find(t => MediaRecorder.isTypeSupported(t)) || '';
+  const audioExt = mimeType.includes('mp4') ? '.mp4'
+                 : mimeType.includes('ogg') ? '.ogg' : '.webm';
+
+  const url = `${proto}://${location.host}/ws-mic?language=${lang}&prompt=${prompt}&fc=${fc}&ext=${encodeURIComponent(audioExt)}`;
 
   micWs = new WebSocket(url);
   micWs.binaryType = 'arraybuffer';
 
   micWs.onopen = () => {
     // MediaRecorder manda chunks de ~3s al WebSocket
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-
-    mediaRec = new MediaRecorder(micStream, { mimeType });
+    mediaRec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
     mediaRec.ondataavailable = (e) => {
       if (e.data.size > 0 && micWs.readyState === WebSocket.OPEN) {
         micWs.send(e.data);
