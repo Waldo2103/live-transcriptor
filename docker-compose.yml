@@ -1,0 +1,21 @@
+services:
+  live-transcriptor:
+    build: .
+    container_name: live-transcriptor
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    volumes:
+      - whisper_cache:/root/.cache/huggingface   # modelo Whisper persistente
+    extra_hosts:
+      - "host.docker.internal:host-gateway"      # acceso a Ollama en el host
+    environment:
+      - WHISPER_MODEL=medium
+      - WHISPER_DEVICE=cpu
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - OLLAMA_MODELO=llama3
+      - LLM_PROVIDER=ollama
+      # - ANTHROPIC_API_KEY=sk-...   # descomentar si usás Claude
+
+volumes:
+  whisper_cache:

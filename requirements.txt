@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+faster-whisper
+sounddevice
+numpy
+websockets
