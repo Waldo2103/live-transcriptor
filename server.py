@@ -950,7 +950,7 @@ function downloadTranscript() {
 
 async function copyText() {
   const lines = [...document.querySelectorAll('.seg-text')].map(el => el.textContent.trim());
-  const text  = lines.join('\n');
+  const text  = lines.join('\\n');
   try {
     await navigator.clipboard.writeText(text);
     const btn = event.target;
