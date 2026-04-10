@@ -16,6 +16,7 @@ services:
       - OLLAMA_MODELO=llama3
       - LLM_PROVIDER=ollama
       # - ANTHROPIC_API_KEY=sk-...   # descomentar si usás Claude
+      # - GROQ_API_KEY=gsk_...       # descomentar para motor Groq (gratis en console.groq.com)
 
 volumes:
   whisper_cache:

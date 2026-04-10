@@ -21,6 +21,7 @@ import tempfile
 from datetime import datetime
 from typing import Optional
 
+import httpx
 import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, HTTPException
@@ -33,11 +34,12 @@ from llm import get_provider
 from fact_checker import FactChecker
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WHISPER_MODEL  = os.getenv("WHISPER_MODEL",  "medium")
+WHISPER_MODEL  = os.getenv("WHISPER_MODEL",  "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 OLLAMA_HOST    = os.getenv("OLLAMA_HOST",    "http://host.docker.internal:11434")
 OLLAMA_MODELO  = os.getenv("OLLAMA_MODELO",  "llama3")
 LLM_PROVIDER   = os.getenv("LLM_PROVIDER",  "ollama")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY",  "")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -149,6 +151,30 @@ def _transcription_worker(source, fact_checker: FactChecker,
                    "msg": "Sesión finalizada."})
 
 
+# ── Groq Whisper API ──────────────────────────────────────────────────────────
+
+async def groq_transcribe(
+    audio_bytes: bytes,
+    filename: str,
+    language: Optional[str],
+    prompt: Optional[str],
+    api_key: str,
+) -> str:
+    """Envía audio a Groq Whisper large-v3-turbo y devuelve el texto."""
+    data   = {"model": "whisper-large-v3-turbo", "response_format": "text"}
+    if language: data["language"] = language
+    if prompt:   data["prompt"]   = prompt
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (filename, audio_bytes, "application/octet-stream")},
+            data=data,
+        )
+        r.raise_for_status()
+        return r.text.strip()
+
+
 # ── API ───────────────────────────────────────────────────────────────────────
 
 @app.post("/api/start")
@@ -250,6 +276,33 @@ def get_transcript(timestamps: str = "si"):
     )
 
 
+@app.post("/api/speech-segment")
+async def speech_segment(text: str = Form(...)):
+    """Recibe segmentos del Web Speech API del browser y los almacena/difunde."""
+    if not text.strip():
+        return {"ok": True}
+    now = datetime.now()
+    started = session.get("started_at")
+    if started:
+        elapsed = (now - datetime.fromisoformat(started)).total_seconds()
+    else:
+        elapsed = 0.0
+        session["started_at"] = now.isoformat()
+        session["active"] = True
+    seg_data = {
+        "type":       "segment",
+        "text":       text.strip(),
+        "ts":         secs_to_ts(elapsed),
+        "start":      elapsed,
+        "end":        elapsed,
+        "language":   "auto",
+        "fact_check": None,
+    }
+    session["segments"].append(seg_data)
+    broadcast(seg_data)
+    return {"ok": True}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     """WebSocket de control: recibe JSON de control, envía segmentos transcritos."""
@@ -274,23 +327,27 @@ async def ws_endpoint(ws: WebSocket):
 @app.websocket("/ws-mic")
 async def ws_mic_endpoint(ws: WebSocket):
     """
-    WebSocket de audio: el browser manda chunks de audio WebM/Opus,
-    el server los convierte a PCM con ffmpeg y transcribe con Whisper.
+    WebSocket de audio. Motores:
+      engine=groq  → audio raw a Groq API (~0.5s, Whisper large-v3-turbo)
+      engine=local → ffmpeg → PCM → Whisper local (lento en CPU)
     """
     await ws.accept()
 
     language       = ws.query_params.get("language", "") or None
     initial_prompt = ws.query_params.get("prompt", "")   or None
     fact_check_on  = ws.query_params.get("fc", "no") == "si"
-    audio_ext      = ws.query_params.get("ext", ".webm")  # Safari manda .mp4
+    audio_ext      = ws.query_params.get("ext", ".webm")
+    engine         = ws.query_params.get("engine", "local")
+    api_key        = ws.query_params.get("key", "") or GROQ_API_KEY
 
-    whisper  = tr.get_transcriber(WHISPER_MODEL, WHISPER_DEVICE)
+    whisper  = tr.get_transcriber(WHISPER_MODEL, WHISPER_DEVICE) if engine == "local" else None
     provider = get_provider(LLM_PROVIDER, host=OLLAMA_HOST, model=OLLAMA_MODELO)
     fc       = FactChecker(provider, enabled=fact_check_on)
     offset   = 0.0
+    CHUNK_SECS = 6.0
 
     broadcast({"type": "status", "status": "running", "msg": "Micrófono conectado. Escuchando..."})
-    await ws.send_json({"type": "debug", "msg": f"Formato de audio: {audio_ext}"})
+    await ws.send_json({"type": "debug", "msg": f"Motor: {engine} | Formato: {audio_ext}"})
 
     chunk_n = 0
     try:
@@ -302,70 +359,94 @@ async def ws_mic_endpoint(ws: WebSocket):
                 break
 
             chunk_n += 1
-            await ws.send_json({"type": "debug", "msg": f"Chunk #{chunk_n}: {len(data)} bytes ({audio_ext})"})
+            await ws.send_json({"type": "debug", "msg": f"Chunk #{chunk_n}: {len(data)} bytes"})
 
-            # Convertir audio del browser → PCM 16kHz mono con ffmpeg
-            with tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False) as f:
-                f.write(data)
-                tmp_in = f.name
-            tmp_out = tmp_in + ".pcm"
-
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", tmp_in,
-                    "-ar", "16000", "-ac", "1", "-f", "s16le", tmp_out,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, ffmpeg_err = await proc.communicate()
-
-                pcm_size = os.path.getsize(tmp_out) if os.path.exists(tmp_out) else 0
-                await ws.send_json({"type": "debug",
-                    "msg": f"ffmpeg rc={proc.returncode} pcm={pcm_size}b" +
-                           (f" err={ffmpeg_err.decode()[:120]}" if ffmpeg_err else "")})
-
-                if pcm_size < 512:
-                    await ws.send_json({"type": "debug", "msg": "PCM muy pequeño, saltando"})
+            if engine == "groq":
+                # ── Groq: audio raw → API (sin ffmpeg) ────────────────────
+                if not api_key:
+                    await ws.send_json({"type": "error", "msg": "Groq: falta la API key."})
+                    break
+                try:
+                    text = await groq_transcribe(
+                        data, f"audio{audio_ext}", language, initial_prompt, api_key
+                    )
+                except httpx.HTTPStatusError as e:
+                    await ws.send_json({"type": "error",
+                        "msg": f"Groq HTTP {e.response.status_code}: {e.response.text[:200]}"})
+                    continue
+                except Exception as e:
+                    await ws.send_json({"type": "error", "msg": f"Groq error: {e}"})
                     continue
 
-                audio = (
-                    np.frombuffer(open(tmp_out, "rb").read(), dtype=np.int16)
-                    .astype(np.float32) / 32_768.0
+                await ws.send_json({"type": "debug", "msg": f"Groq OK: {len(text)} chars"})
+                if text:
+                    seg_data = {
+                        "type":       "segment",
+                        "text":       text,
+                        "ts":         secs_to_ts(offset),
+                        "start":      offset,
+                        "end":        offset + CHUNK_SECS,
+                        "language":   language or "es",
+                        "fact_check": None,
+                    }
+                    session["segments"].append(seg_data)
+                    await ws.send_json(seg_data)
+                    broadcast(seg_data)
+                    offset += CHUNK_SECS
+
+            else:
+                # ── Whisper local: ffmpeg → PCM → transcribe ───────────────
+                with tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False) as f:
+                    f.write(data)
+                    tmp_in = f.name
+                tmp_out = tmp_in + ".pcm"
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", tmp_in,
+                        "-ar", "16000", "-ac", "1", "-f", "s16le", tmp_out,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, ffmpeg_err = await proc.communicate()
+                    pcm_size = os.path.getsize(tmp_out) if os.path.exists(tmp_out) else 0
+                    await ws.send_json({"type": "debug",
+                        "msg": f"ffmpeg rc={proc.returncode} pcm={pcm_size}b" +
+                               (f" | {ffmpeg_err.decode()[:100]}" if ffmpeg_err else "")})
+                    if pcm_size < 512:
+                        continue
+                    audio_arr = (
+                        np.frombuffer(open(tmp_out, "rb").read(), dtype=np.int16)
+                        .astype(np.float32) / 32_768.0
+                    )
+                finally:
+                    os.unlink(tmp_in)
+                    if os.path.exists(tmp_out):
+                        os.unlink(tmp_out)
+
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda a=audio_arr, o=offset: whisper.transcribe(
+                        a, offset=o, language=language, initial_prompt=initial_prompt
+                    )
                 )
-                await ws.send_json({"type": "debug", "msg": f"Audio: {len(audio)/16000:.1f}s → Whisper..."})
-            finally:
-                os.unlink(tmp_in)
-                if os.path.exists(tmp_out):
-                    os.unlink(tmp_out)
-
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda a=audio, o=offset: whisper.transcribe(
-                    a, offset=o, language=language, initial_prompt=initial_prompt
-                )
-            )
-
-            for seg in result.segments:
-                fc_result = fc.check(seg.text)
-                seg_data  = {
-                    "type":       "segment",
-                    "text":       seg.text,
-                    "ts":         secs_to_ts(seg.start),
-                    "start":      seg.start,
-                    "end":        seg.end,
-                    "language":   result.language,
-                    "fact_check": fc_result,
-                }
-                session["segments"].append(seg_data)
-                await ws.send_json(seg_data)
-                broadcast(seg_data)
-
-            await ws.send_json({"type": "debug",
-                "msg": f"Whisper: {len(result.segments)} segmentos (idioma={result.language})"})
-
-            if result.segments:
-                offset = result.segments[-1].end
+                await ws.send_json({"type": "debug",
+                    "msg": f"Whisper: {len(result.segments)} segs (lang={result.language})"})
+                for seg in result.segments:
+                    seg_data = {
+                        "type":       "segment",
+                        "text":       seg.text,
+                        "ts":         secs_to_ts(seg.start),
+                        "start":      seg.start,
+                        "end":        seg.end,
+                        "language":   result.language,
+                        "fact_check": fc.check(seg.text),
+                    }
+                    session["segments"].append(seg_data)
+                    await ws.send_json(seg_data)
+                    broadcast(seg_data)
+                if result.segments:
+                    offset = result.segments[-1].end
 
     except WebSocketDisconnect:
         pass
@@ -573,6 +654,34 @@ input:checked + .slider:before { transform: translateX(16px); }
         <button class="source-tab"        id="tab-youtube" onclick="setSource('youtube')">▶ YouTube</button>
       </div>
 
+      <!-- Panel micrófono: selector de motor -->
+      <div id="panel-mic">
+        <div class="section-label" style="margin-top:.5rem">Motor</div>
+        <div class="source-tabs" id="engine-tabs">
+          <button class="source-tab" id="eng-groq"   onclick="setEngine('groq')">🤖 Groq</button>
+          <button class="source-tab" id="eng-speech" onclick="setEngine('speech')">🌐 Web Speech</button>
+          <button class="source-tab active" id="eng-local" onclick="setEngine('local')">🖥 Local</button>
+        </div>
+        <!-- Panel Groq -->
+        <div id="panel-groq" style="display:none" class="input-group">
+          <label>Groq API Key</label>
+          <input type="password" id="input-groq-key" placeholder="gsk_..."
+                 oninput="localStorage.setItem('groq_key', this.value)">
+          <span style="font-size:.7rem;color:#4a5568;margin-top:.2rem">
+            Gratis en <strong>console.groq.com</strong> · Whisper large-v3-turbo
+          </span>
+        </div>
+        <!-- Panel Web Speech -->
+        <div id="panel-speech" style="display:none">
+          <p style="font-size:.75rem;color:#718096;line-height:1.5;margin-top:.35rem">
+            Usa el reconocimiento de voz del browser.<br>
+            ✅ Instantáneo &nbsp;✅ Sin API key<br>
+            ⚠️ Solo Chrome / Edge
+          </p>
+        </div>
+      </div>
+
+      <!-- Panel YouTube -->
       <div id="panel-youtube" style="display:none" class="input-group">
         <label>URL del video o stream</label>
         <input type="url" id="input-url" placeholder="https://youtube.com/watch?v=...">
@@ -588,7 +697,7 @@ input:checked + .slider:before { transform: translateX(16px); }
           <span class="slider"></span>
         </label>
       </div>
-      <div class="toggle-row">
+      <div class="toggle-row" id="row-fc">
         <label>Fact-check <span style="color:#4a5568;font-size:.7rem">(slow)</span></label>
         <label class="toggle">
           <input type="checkbox" id="tog-fc" onchange="toggleFactcheck()">
@@ -607,7 +716,7 @@ input:checked + .slider:before { transform: translateX(16px); }
       </select>
     </div>
 
-    <div class="input-group">
+    <div class="input-group" id="row-prompt">
       <label>Prompt inicial (vocabulario clave)</label>
       <input type="text" id="input-prompt"
              placeholder="ej: San Lorenzo, Boedo, elecciones">
@@ -640,10 +749,17 @@ input:checked + .slider:before { transform: translateX(16px); }
 
 <script>
 // ── Estado ──────────────────────────────────────────────────────────────────
-let ws          = null;
+let ws           = null;
 let activeSource = 'microphone';
+let activeEngine = 'local';
 let showTs       = true;
 let segmentCount = 0;
+
+// Recuperar API key guardada
+document.addEventListener('DOMContentLoaded', () => {
+  const saved = localStorage.getItem('groq_key');
+  if (saved) document.getElementById('input-groq-key').value = saved;
+});
 
 // ── WebSocket ────────────────────────────────────────────────────────────────
 function connectWS() {
@@ -744,7 +860,19 @@ function setSource(s) {
   activeSource = s;
   document.getElementById('tab-mic').classList.toggle('active', s === 'microphone');
   document.getElementById('tab-youtube').classList.toggle('active', s === 'youtube');
-  document.getElementById('panel-youtube').style.display = s === 'youtube' ? 'block' : 'none';
+  document.getElementById('panel-mic').style.display     = s === 'microphone' ? 'block' : 'none';
+  document.getElementById('panel-youtube').style.display = s === 'youtube'    ? 'block' : 'none';
+}
+
+function setEngine(e) {
+  activeEngine = e;
+  ['groq','speech','local'].forEach(id => {
+    document.getElementById('eng-' + id).classList.toggle('active', id === e);
+  });
+  document.getElementById('panel-groq').style.display   = e === 'groq'   ? 'block' : 'none';
+  document.getElementById('panel-speech').style.display = e === 'speech' ? 'block' : 'none';
+  // Prompt no aplica a Web Speech (el browser no lo usa)
+  document.getElementById('row-prompt').style.display   = e === 'speech' ? 'none'  : '';
 }
 
 function toggleTimestamps() {
@@ -774,7 +902,11 @@ async function startSession() {
   setStatus('starting', 'Conectando...');
 
   if (activeSource === 'microphone') {
-    await startMic();
+    if (activeEngine === 'speech') {
+      startWebSpeech();
+    } else {
+      await startMic();
+    }
     return;
   }
 
@@ -807,7 +939,8 @@ async function startSession() {
 
 async function stopSession() {
   if (activeSource === 'microphone') {
-    stopMic();
+    if (activeEngine === 'speech') stopWebSpeech();
+    else stopMic();
   } else {
     await fetch('/api/stop', {method: 'POST'});
   }
@@ -853,76 +986,112 @@ async function startMic() {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch(e) {
     alert('No se pudo acceder al micrófono: ' + e.message);
-    resetUI();
-    return;
+    resetUI(); return;
   }
 
-  const lang   = document.getElementById('sel-lang').value;
-  const prompt = encodeURIComponent(document.getElementById('input-prompt').value.trim());
-  const fc     = document.getElementById('tog-fc').checked ? 'si' : 'no';
-  const proto  = location.protocol === 'https:' ? 'wss' : 'ws';
+  const lang    = document.getElementById('sel-lang').value;
+  const prompt  = encodeURIComponent(document.getElementById('input-prompt').value.trim());
+  const fc      = document.getElementById('tog-fc').checked ? 'si' : 'no';
+  const proto   = location.protocol === 'https:' ? 'wss' : 'ws';
+  const groqKey = encodeURIComponent(document.getElementById('input-groq-key')?.value.trim() || '');
 
-  // Safari usa mp4; Chrome/Firefox usan webm — detectar antes de abrir el WS
-  const MIME_CANDIDATES = [
-    'audio/webm;codecs=opus', 'audio/webm',
-    'audio/mp4', 'audio/ogg;codecs=opus',
-  ];
+  const MIME_CANDIDATES = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
   const mimeType = MIME_CANDIDATES.find(t => MediaRecorder.isTypeSupported(t)) || '';
-  const audioExt = mimeType.includes('mp4') ? '.mp4'
-                 : mimeType.includes('ogg') ? '.ogg' : '.webm';
+  const audioExt = mimeType.includes('mp4') ? '.mp4' : mimeType.includes('ogg') ? '.ogg' : '.webm';
 
-  const url = `${proto}://${location.host}/ws-mic?language=${lang}&prompt=${prompt}&fc=${fc}&ext=${encodeURIComponent(audioExt)}`;
+  const url = `${proto}://${location.host}/ws-mic?language=${lang}&prompt=${prompt}&fc=${fc}` +
+              `&ext=${encodeURIComponent(audioExt)}&engine=${activeEngine}&key=${groqKey}`;
 
   micWs = new WebSocket(url);
   micWs.binaryType = 'arraybuffer';
 
   micWs.onopen = () => {
-    addDebug(`mimeType elegido: "${mimeType || '(default)'}" → ext=${audioExt}`);
-    setStatus('running', 'Escuchando micrófono...');
+    addDebug(`mimeType: "${mimeType || '(default)'}" ext=${audioExt} engine=${activeEngine}`);
+    function startChunk() {
+      if (!micStream || !micWs || micWs.readyState !== WebSocket.OPEN) return;
+      const rec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
+      mediaRec  = rec;
+      rec.ondataavailable = (e) => {
+        if (e.data.size > 0 && micWs && micWs.readyState === WebSocket.OPEN) micWs.send(e.data);
+      };
+      rec.onstop = () => startChunk();
+      rec.start();
+      setTimeout(() => { if (rec.state === 'recording') rec.stop(); }, 6000);
+    }
     startChunk();
+    setStatus('running', 'Escuchando micrófono...');
   };
 
-  function startChunk() {
-    if (!micStream || !micWs || micWs.readyState !== WebSocket.OPEN) return;
-
-    // Crear un MediaRecorder nuevo por chunk: cada stop() produce un WebM
-    // completo con header propio, que ffmpeg puede parsear correctamente.
-    const rec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
-    mediaRec = rec;
-
-    rec.ondataavailable = (e) => {
-      if (e.data.size > 0 && micWs && micWs.readyState === WebSocket.OPEN) {
-        micWs.send(e.data);
-      }
-    };
-
-    rec.onstop = () => {
-      // Arrancar el próximo chunk inmediatamente
-      startChunk();
-    };
-
-    rec.start();
-    // Detener después de 6s → ondataavailable → onstop → startChunk
-    setTimeout(() => {
-      if (rec.state === 'recording') rec.stop();
-    }, 6000);
-  }
-
-  micWs.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    handleMessage(msg);
-  };
-
-  micWs.onclose = () => stopMic(false);
+  micWs.onmessage = (e) => { handleMessage(JSON.parse(e.data)); };
+  micWs.onclose   = () => stopMic();
 }
 
 function stopMic() {
-  // Cerrar el WS primero para que startChunk() no lance otro ciclo
   if (micWs && micWs.readyState === WebSocket.OPEN) micWs.close();
   micWs = null;
   if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
   mediaRec = null;
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+// ── Web Speech API ────────────────────────────────────────────────────────────
+let speechRec  = null;
+let interimDiv = null;
+
+function startWebSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { alert('Web Speech API no disponible. Usá Chrome o Edge.'); resetUI(); return; }
+  const lang = document.getElementById('sel-lang').value || 'es-AR';
+
+  speechRec = new SR();
+  speechRec.continuous     = true;
+  speechRec.interimResults = true;
+  speechRec.lang           = lang;
+
+  speechRec.onresult = async (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) {
+        const text = r[0].transcript.trim();
+        if (text) {
+          removeInterim();
+          document.getElementById('empty-state')?.remove();
+          addSegment({ text, ts: '', fact_check: null });
+          const fd = new FormData(); fd.append('text', text);
+          fetch('/api/speech-segment', { method: 'POST', body: fd });
+        }
+      } else { interim += r[0].transcript; }
+    }
+    showInterim(interim);
+  };
+
+  speechRec.onerror = (e) => {
+    if (e.error !== 'no-speech') setStatus('error', 'Web Speech: ' + e.error);
+  };
+  speechRec.onend = () => { if (speechRec) speechRec.start(); };
+  speechRec.start();
+  setStatus('running', 'Web Speech escuchando...');
+}
+
+function stopWebSpeech() {
+  if (speechRec) { speechRec.onend = null; speechRec.stop(); speechRec = null; }
+  removeInterim();
+}
+
+function showInterim(text) {
+  if (!text) { removeInterim(); return; }
+  if (!interimDiv) {
+    interimDiv = document.createElement('div');
+    interimDiv.style.cssText = 'padding:.5rem .6rem;color:#4a5568;font-style:italic;font-size:.9rem';
+    document.getElementById('transcript-area').appendChild(interimDiv);
+  }
+  interimDiv.textContent = text;
+  document.getElementById('transcript-area').scrollTop = 9999;
+}
+
+function removeInterim() {
+  if (interimDiv) { interimDiv.remove(); interimDiv = null; }
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
