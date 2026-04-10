@@ -347,7 +347,7 @@ async def ws_mic_endpoint(ws: WebSocket):
     CHUNK_SECS = 6.0
 
     broadcast({"type": "status", "status": "running", "msg": "Micrófono conectado. Escuchando..."})
-    await ws.send_json({"type": "debug", "msg": f"Motor: {engine} | Formato: {audio_ext}"})
+    print(f"[ws-mic] engine={engine} ext={audio_ext}")
 
     chunk_n = 0
     try:
@@ -355,11 +355,11 @@ async def ws_mic_endpoint(ws: WebSocket):
             try:
                 data = await asyncio.wait_for(ws.receive_bytes(), timeout=30)
             except asyncio.TimeoutError:
-                await ws.send_json({"type": "debug", "msg": "Timeout: no llegaron chunks en 30s"})
+                print("[ws-mic] timeout: no llegaron chunks en 30s")
                 break
 
             chunk_n += 1
-            await ws.send_json({"type": "debug", "msg": f"Chunk #{chunk_n}: {len(data)} bytes"})
+            print(f"[ws-mic] chunk #{chunk_n}: {len(data)} bytes")
 
             if engine == "groq":
                 # ── Groq: audio raw → API (sin ffmpeg) ────────────────────
@@ -378,7 +378,7 @@ async def ws_mic_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "error", "msg": f"Groq error: {e}"})
                     continue
 
-                await ws.send_json({"type": "debug", "msg": f"Groq OK: {len(text)} chars"})
+                print(f"[ws-mic] Groq OK: {len(text)} chars")
                 if text:
                     seg_data = {
                         "type":       "segment",
@@ -390,8 +390,7 @@ async def ws_mic_endpoint(ws: WebSocket):
                         "fact_check": None,
                     }
                     session["segments"].append(seg_data)
-                    await ws.send_json(seg_data)
-                    broadcast(seg_data)
+                    broadcast(seg_data)   # llega una sola vez por /ws
                     offset += CHUNK_SECS
 
             else:
@@ -410,9 +409,7 @@ async def ws_mic_endpoint(ws: WebSocket):
                     )
                     _, ffmpeg_err = await proc.communicate()
                     pcm_size = os.path.getsize(tmp_out) if os.path.exists(tmp_out) else 0
-                    await ws.send_json({"type": "debug",
-                        "msg": f"ffmpeg rc={proc.returncode} pcm={pcm_size}b" +
-                               (f" | {ffmpeg_err.decode()[:100]}" if ffmpeg_err else "")})
+                    print(f"[ws-mic] ffmpeg rc={proc.returncode} pcm={pcm_size}b")
                     if pcm_size < 512:
                         continue
                     audio_arr = (
@@ -430,8 +427,7 @@ async def ws_mic_endpoint(ws: WebSocket):
                         a, offset=o, language=language, initial_prompt=initial_prompt
                     )
                 )
-                await ws.send_json({"type": "debug",
-                    "msg": f"Whisper: {len(result.segments)} segs (lang={result.language})"})
+                print(f"[ws-mic] Whisper: {len(result.segments)} segs")
                 for seg in result.segments:
                     seg_data = {
                         "type":       "segment",
@@ -443,8 +439,7 @@ async def ws_mic_endpoint(ws: WebSocket):
                         "fact_check": fc.check(seg.text),
                     }
                     session["segments"].append(seg_data)
-                    await ws.send_json(seg_data)
-                    broadcast(seg_data)
+                    broadcast(seg_data)   # llega una sola vez por /ws
                 if result.segments:
                     offset = result.segments[-1].end
 
@@ -690,13 +685,6 @@ input:checked + .slider:before { transform: translateX(16px); }
 
     <div>
       <div class="section-label">Opciones</div>
-      <div class="toggle-row">
-        <label>Timestamps</label>
-        <label class="toggle">
-          <input type="checkbox" id="tog-timestamps" checked onchange="toggleTimestamps()">
-          <span class="slider"></span>
-        </label>
-      </div>
       <div class="toggle-row" id="row-fc">
         <label>Fact-check <span style="color:#4a5568;font-size:.7rem">(slow)</span></label>
         <label class="toggle">
@@ -740,7 +728,13 @@ input:checked + .slider:before { transform: translateX(16px); }
 
     <div class="toolbar">
       <button class="btn btn-ghost" onclick="clearTranscript()">🗑 Limpiar</button>
-      <button class="btn btn-ghost" onclick="downloadTranscript()">⬇ Descargar .txt</button>
+      <button class="btn btn-ghost" onclick="copyText()" title="Copiar texto sin timestamps">📋 Copiar</button>
+      <button class="btn btn-ghost" onclick="downloadTranscript()">⬇ Descargar</button>
+      <label style="display:flex;align-items:center;gap:.4rem;font-size:.78rem;color:#718096;cursor:pointer;margin-left:.5rem">
+        <input type="checkbox" id="tog-timestamps" checked onchange="toggleTimestamps()"
+               style="width:auto;accent-color:#3b82f6">
+        Timestamps
+      </label>
       <span id="seg-count" style="font-size:.75rem;color:#4a5568;margin-left:auto"></span>
     </div>
   </div>
@@ -808,18 +802,7 @@ function handleMessage(msg) {
     document.getElementById('btn-start').disabled = false;
     document.getElementById('btn-stop').disabled  = true;
   }
-  if (msg.type === 'debug') {
-    addDebug(msg.msg);
-  }
-}
-
-function addDebug(msg) {
-  const area = document.getElementById('transcript-area');
-  const div  = document.createElement('div');
-  div.style.cssText = 'font-size:.7rem;color:#4a5568;font-family:monospace;padding:.1rem .6rem';
-  div.textContent = '› ' + msg;
-  area.appendChild(div);
-  area.scrollTop = area.scrollHeight;
+  // type==='debug' se ignora en la UI (va a los logs del servidor)
 }
 
 // ── Segmentos ────────────────────────────────────────────────────────────────
@@ -965,6 +948,20 @@ function downloadTranscript() {
   window.location.href = '/api/transcript?timestamps=' + ts;
 }
 
+async function copyText() {
+  const lines = [...document.querySelectorAll('.seg-text')].map(el => el.textContent.trim());
+  const text  = lines.join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    const btn = event.target;
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copiado';
+    setTimeout(() => btn.textContent = orig, 1500);
+  } catch(e) {
+    alert('No se pudo copiar: ' + e.message);
+  }
+}
+
 function setStatus(status, msg) {
   const dot  = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
@@ -1006,7 +1003,7 @@ async function startMic() {
   micWs.binaryType = 'arraybuffer';
 
   micWs.onopen = () => {
-    addDebug(`mimeType: "${mimeType || '(default)'}" ext=${audioExt} engine=${activeEngine}`);
+    console.log(`[mic] mimeType: "${mimeType || '(default)'}" ext=${audioExt} engine=${activeEngine}`);
     function startChunk() {
       if (!micStream || !micWs || micWs.readyState !== WebSocket.OPEN) return;
       const rec = new MediaRecorder(micStream, mimeType ? { mimeType } : {});
